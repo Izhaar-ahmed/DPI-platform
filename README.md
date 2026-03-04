@@ -13,62 +13,66 @@
 
 ---
 
-A complete network traffic analysis platform that combines a **multi-threaded C++ DPI engine** with a **Python FastAPI REST service**. Upload PCAP captures, classify applications via TLS SNI extraction, enforce blocking rules, and generate detailed traffic reports — all containerized with Docker.
+## What Is This?
 
-| Component | Language | Purpose |
-|-----------|----------|---------|
-| **DPI Engine** | C++17 | Multi-threaded packet parsing, flow tracking, SNI extraction, rule enforcement |
-| **NetAnalyzer** | Python 3.11 | REST API for PCAP uploads, rule management, flow queries |
-| **Docker** | YAML | One-command deployment of both services |
+DPI Platform is a **network traffic analysis system** that reads captured network traffic (PCAP files), inspects every packet down to the application layer, identifies which app or service generated the traffic, and optionally blocks unwanted connections — all without breaking encryption.
+
+It ships as **two independent components** that share PCAP files and rules:
+
+| Component | Built With | What It Does |
+|-----------|------------|--------------|
+| **DPI Engine** | C++17, pthreads | Reads PCAPs at high speed using a multi-threaded pipeline. Parses protocols (Ethernet → IP → TCP/UDP → TLS), extracts SNI hostnames, classifies traffic by application, enforces blocking rules, and writes filtered output. |
+| **NetAnalyzer** | Python 3.11, FastAPI, Scapy | Provides a REST API for uploading PCAPs, querying analysis results, and managing blocking rules. Ideal for integration with dashboards and automation tools. |
+
+Both can run together via **Docker Compose**, or independently.
 
 ---
 
 ## 📑 Table of Contents
 
-- [Quick Start](#-quick-start)
-- [Architecture](#-architecture)
-- [How It Works](#-how-it-works)
-- [Project Structure](#-project-structure)
-- [C++ Engine](#-c-engine)
-- [Python API (NetAnalyzer)](#-python-api-netanalyzer)
-- [API Reference](#-api-reference)
-- [Docker Deployment](#-docker-deployment)
-- [Building from Source](#-building-from-source)
-- [Configuration](#-configuration)
-- [Testing](#-testing)
-- [License](#-license)
+1. [Quick Start](#-quick-start)
+2. [How It Works — The DPI Pipeline](#-how-it-works--the-dpi-pipeline)
+3. [Architecture & Threading Model](#-architecture--threading-model)
+4. [Project Structure](#-project-structure)
+5. [C++ Engine — Usage & Options](#-c-engine--usage--options)
+6. [Python API — NetAnalyzer](#-python-api--netanalyzer)
+7. [API Reference](#-api-reference)
+8. [Docker Deployment](#-docker-deployment)
+9. [Building from Source](#-building-from-source)
+10. [Configuration](#-configuration)
+11. [Testing](#-testing)
+12. [License](#-license)
 
 ---
 
 ## 🚀 Quick Start
 
-### Option 1: Docker (Recommended)
+### Option 1 — Docker (Recommended)
 
 ```bash
-# Clone the repository
 git clone https://github.com/Izhaar-ahmed/DPI-platform.git
 cd DPI-platform
 
-# Start the API service
+# Start the REST API
 docker compose up -d netanalyzer
 
-# Analyze a PCAP file via the API
+# Upload and analyze a PCAP file
 curl -X POST http://localhost:8000/api/v1/analyze \
   -F "file=@test_dpi.pcap"
 
-# Run the C++ engine directly
+# Or run the C++ engine directly
 docker compose run --rm dpi-engine /data/test_dpi.pcap /output/result.pcap \
   --block-app YouTube
 ```
 
-### Option 2: Build Locally
+### Option 2 — Build Locally
 
 ```bash
 # Build the C++ engine
 cmake -B build && cmake --build build
 
-# Run analysis
-./build/dpi_engine test_dpi.pcap output.pcap --block-app YouTube --block-domain tiktok
+# Run analysis (blocks YouTube traffic, writes filtered output)
+./build/dpi_engine test_dpi.pcap output.pcap --block-app YouTube
 
 # Start the Python API
 cd netanalyzer
@@ -78,115 +82,114 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ---
 
-## 🏗 Architecture
+## 🔍 How It Works — The DPI Pipeline
+
+Every packet goes through **four stages**. Here's what happens at each one:
+
+### Stage 1 — Parse Protocol Layers
+
+The engine peels apart each packet layer by layer, extracting metadata at each level:
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         DPI PLATFORM                                │
-├──────────────────────────────┬──────────────────────────────────────┤
-│       C++ DPI Engine         │        Python NetAnalyzer           │
-│                              │                                      │
-│  ┌────────────────────────┐  │  ┌────────────────────────────────┐  │
-│  │     PCAP Reader        │  │  │    FastAPI Application         │  │
-│  │  (reads raw packets)   │  │  │                                │  │
-│  └──────────┬─────────────┘  │  │  POST /api/v1/analyze          │  │
-│             │                │  │  GET  /api/v1/flows             │  │
-│      hash(5-tuple) % N       │  │  CRUD /api/v1/rules/*          │  │
-│       ┌─────┴─────┐         │  │                                │  │
-│       ▼           ▼         │  │  ┌──────────┐ ┌─────────────┐  │  │
-│  ┌─────────┐ ┌─────────┐   │  │  │  Scapy   │ │ Rule Engine │  │  │
-│  │  LB 0   │ │  LB 1   │   │  │  │ Analyzer │ │  (JSON)     │  │  │
-│  └────┬────┘ └────┬────┘   │  │  └──────────┘ └─────────────┘  │  │
-│       │           │         │  │                                │  │
-│   ┌───┴───┐   ┌───┴───┐   │  └────────────────────────────────┘  │
-│   ▼       ▼   ▼       ▼   │                                      │
-│ ┌────┐ ┌────┐┌────┐ ┌────┐│                                      │
-│ │FP 0│ │FP 1││FP 2│ │FP 3││  Shared: PCAP files, rules.json     │
-│ └──┬─┘ └──┬─┘└──┬─┘ └──┬─┘│                                      │
-│    └───┬───┘    └───┬───┘  │                                      │
-│        └──────┬─────┘      │                                      │
-│               ▼            │                                      │
-│    ┌──────────────────┐    │                                      │
-│    │  Output Writer   │    │                                      │
-│    │ (filtered PCAP)  │    │                                      │
-│    └──────────────────┘    │                                      │
-└──────────────────────────────┴──────────────────────────────────────┘
+Ethernet Frame
+ └─ MAC addresses, EtherType (is it IPv4?)
+     └─ IPv4 Header
+         └─ Source IP, Destination IP, Protocol (TCP or UDP?), TTL
+             └─ TCP / UDP Header
+                 └─ Source Port, Destination Port, Flags, Sequence Numbers
+                     └─ Application Payload (TLS, HTTP, DNS, etc.)
 ```
 
-### Threading Model
+### Stage 2 — Track Flows
 
-The C++ engine uses a **pipelined, multi-threaded architecture**:
-
-| Stage | Thread(s) | Responsibility |
-|-------|-----------|----------------|
-| **Reader** | 1 | Reads PCAP, hashes 5-tuple, dispatches to LBs |
-| **Load Balancers** | N (default 2) | Distribute packets to Fast Paths via consistent hashing |
-| **Fast Paths** | M (default 2 per LB) | DPI processing: SNI extraction, classification, rule matching |
-| **Output Writer** | 1 | Writes allowed packets to the output PCAP file |
-
-> **Consistent hashing** ensures all packets from the same connection (5-tuple) are always routed to the same Fast Path thread — enabling correct stateful flow tracking without locks.
-
----
-
-## 🔍 How It Works
-
-### Deep Packet Inspection in 4 Steps
+Packets don't exist in isolation — they belong to **connections** (flows). The engine groups packets using the **five-tuple**:
 
 ```
-  ┌──────────────────────────────────────────────────────────────┐
-  │ 1. PARSE — Peel protocol layers                              │
-  │                                                              │
-  │    ┌─────────────┐                                           │
-  │    │  Ethernet   │ → MAC addresses, EtherType                │
-  │    │  ┌────────┐ │                                           │
-  │    │  │  IPv4  │ │ → Source/Dest IP, Protocol, TTL           │
-  │    │  │ ┌────┐ │ │                                           │
-  │    │  │ │TCP │ │ │ → Source/Dest Port, Flags, Seq Numbers    │
-  │    │  │ │┌──┐│ │ │                                           │
-  │    │  │ ││TLS│ │ │ → Client Hello → SNI hostname             │
-  │    │  │ │└──┘│ │ │                                           │
-  │    │  │ └────┘ │ │                                           │
-  │    │  └────────┘ │                                           │
-  │    └─────────────┘                                           │
-  ├──────────────────────────────────────────────────────────────┤
-  │ 2. TRACK — Group packets into flows using the 5-tuple        │
-  │    (src_ip, dst_ip, src_port, dst_port, protocol)            │
-  ├──────────────────────────────────────────────────────────────┤
-  │ 3. CLASSIFY — Extract SNI from TLS Client Hello              │
-  │    "www.youtube.com" → AppType::YOUTUBE                      │
-  ├──────────────────────────────────────────────────────────────┤
-  │ 4. ENFORCE — Check rules → FORWARD or DROP the entire flow   │
-  └──────────────────────────────────────────────────────────────┘
+(Source IP, Destination IP, Source Port, Destination Port, Protocol)
 ```
 
-### SNI Extraction
+A hash of the five-tuple is used as the flow identifier. All packets with the same five-tuple are processed by the **same thread**, which means the engine can track connection state (SYN → SYN-ACK → established → FIN) without needing locks.
 
-Even though HTTPS traffic is encrypted, the **TLS Client Hello** message contains the destination hostname in plaintext (the **Server Name Indication** field). This is the key that enables application-level classification:
+### Stage 3 — Classify the Application
+
+Even though HTTPS traffic is encrypted, the **TLS Client Hello** message includes the destination hostname in plaintext — this is the **Server Name Indication (SNI)** field:
 
 ```
-TLS Record:
+TLS Record
   Content Type: 0x16 (Handshake)
   └── Handshake Type: 0x01 (Client Hello)
       ├── Version, Random, Session ID …
-      └── Extensions:
-          └── SNI Extension (type 0x0000):
+      └── Extensions
+          └── SNI Extension (type 0x0000)
               └── "www.youtube.com"  ← extracted!
 ```
 
-The engine also extracts the `Host:` header from plaintext HTTP traffic.
+The engine also extracts the `Host:` header from plaintext HTTP traffic and can parse DNS queries.
 
-### Flow-Based Blocking
+Once a hostname is extracted, it's matched against a table of known domain signatures using **suffix matching** — `youtube.com` matches `www.youtube.com` but does *not* match `youtubedownloader.com`.
 
-Blocking operates at the **flow level**, not the individual packet level:
+**Currently recognized applications:**
+Google · YouTube · Facebook · Instagram · Twitter/X · TikTok · Netflix · Amazon · Microsoft · Apple · WhatsApp · Telegram · Discord · Spotify · Zoom · GitHub · Cloudflare
+
+### Stage 4 — Enforce Blocking Rules
+
+If a flow matches any active rule, the engine marks the **entire flow** as blocked — all future packets on that connection are dropped:
 
 ```
-Packet 1  (SYN)            → No SNI yet → Forward
-Packet 2  (SYN-ACK)        → No SNI yet → Forward
-Packet 3  (Client Hello)   → SNI: youtube.com → BLOCKED!
-Packet 4+ (all subsequent) → Flow marked blocked → Drop
+Packet 1  (SYN)          → No SNI yet       → Forward ✓
+Packet 2  (SYN-ACK)      → No SNI yet       → Forward ✓
+Packet 3  (Client Hello) → SNI: youtube.com  → Flow BLOCKED ✗
+Packet 4+ (any data)     → Flow is blocked   → Drop ✗
 ```
 
-Once a flow is classified and matches a blocking rule, **all subsequent packets** in that connection are dropped.
+This is important: blocking happens at the **flow level**, not the packet level. Once a flow is classified and matches a rule, it stays blocked for the entire connection lifetime.
+
+---
+
+## 🏗 Architecture & Threading Model
+
+The C++ engine uses a **pipelined, multi-threaded architecture** where each stage runs on its own thread(s):
+
+```mermaid
+flowchart TB
+    subgraph CPP["⚙️ C++ DPI Engine"]
+        direction TB
+        PCAP["PCAP Reader\n(reads raw packets)"]
+        PCAP -->|"hash(5-tuple) % N"| LB0["LB 0"]
+        PCAP -->|"hash(5-tuple) % N"| LB1["LB 1"]
+        LB0 --> FP0["FP 0"]
+        LB0 --> FP1["FP 1"]
+        LB1 --> FP2["FP 2"]
+        LB1 --> FP3["FP 3"]
+        FP0 & FP1 & FP2 & FP3 --> OUT["Output Writer\n(filtered PCAP)"]
+    end
+
+    subgraph PY["🐍 Python NetAnalyzer"]
+        direction TB
+        API["FastAPI Application\nPOST /api/v1/analyze\nGET  /api/v1/flows\nCRUD /api/v1/rules/*"]
+        SCAPY["Scapy Analyzer"]
+        RULES["Rule Engine (JSON)"]
+        API --> SCAPY
+        API --> RULES
+    end
+
+    SHARED[/"📁 Shared: PCAP files, rules.json"/]
+    CPP -.-> SHARED
+    PY -.-> SHARED
+```
+
+### Thread Responsibilities
+
+| Stage | Threads | What It Does |
+|-------|---------|--------------|
+| **Reader** | 1 | Reads packets from the input PCAP, parses headers, computes the five-tuple hash, and dispatches each packet to the correct Load Balancer. |
+| **Load Balancers (LB)** | N (default: 2) | Receive packets from the Reader and distribute them to Fast Paths via consistent hashing. This second level of distribution allows scaling the number of DPI threads independently. |
+| **Fast Paths (FP)** | M per LB (default: 2) | The core DPI workers. Each FP thread maintains its own `ConnectionTracker` and performs: SNI extraction, HTTP Host parsing, application classification, TCP state tracking, and rule enforcement. |
+| **Output Writer** | 1 | Collects forwarded packets from all FP threads and writes them to the output PCAP file. |
+
+> **Why consistent hashing?** All packets from the same connection (five-tuple) are always routed to the **same Fast Path thread**. This means each FP can track connection state in its own local hash map — no locks, no contention, no data races.
+
+**Inter-thread communication** uses a bounded, thread-safe queue (`ThreadSafeQueue<T>`) built on `std::mutex` + `std::condition_variable`, with backpressure (blocks when full) and graceful shutdown support.
 
 ---
 
@@ -209,15 +212,15 @@ DPI-platform/
 │   └── platform.h                     Cross-platform byte order utils
 │
 ├── src/                              C++ Source
-│   ├── main_dpi.cpp                   Entry point for dpi_engine
-│   ├── dpi_engine.cpp                 Multi-threaded pipeline orchestrator
+│   ├── main_dpi.cpp                   Entry point — CLI arg parsing
+│   ├── dpi_engine.cpp                 Pipeline orchestrator (start/stop/drain)
 │   ├── fast_path.cpp                  Per-thread DPI processing
 │   ├── load_balancer.cpp              Packet distribution logic
 │   ├── connection_tracker.cpp         Flow table management
 │   ├── rule_manager.cpp               Rule loading (JSON/INI), hot-reload
 │   ├── pcap_reader.cpp                Binary PCAP file I/O
 │   ├── packet_parser.cpp              Protocol header dissection
-│   ├── sni_extractor.cpp              TLS/HTTP deep inspection
+│   ├── sni_extractor.cpp              TLS/HTTP/DNS/QUIC deep inspection
 │   ├── types.cpp                      Domain→App mapping with suffix match
 │   ├── main_working.cpp               Standalone single-threaded demo
 │   ├── main.cpp                       Legacy simple packet viewer
@@ -225,7 +228,7 @@ DPI-platform/
 │
 ├── netanalyzer/                      Python FastAPI Service
 │   ├── app/
-│   │   ├── main.py                    App setup, CORS, lifespan, health
+│   │   ├── main.py                    App setup, CORS, logging, health check
 │   │   ├── core/
 │   │   │   ├── config.py              Pydantic settings (env vars)
 │   │   │   └── exceptions.py          Custom error types
@@ -251,63 +254,74 @@ DPI-platform/
 │   └── Dockerfile.cpp                 Multi-stage C++ build container
 │
 ├── docker-compose.yml                 Production deployment
-├── docker-compose.dev.yml             Development overrides
-├── CMakeLists.txt                     CMake build (3 targets)
-├── generate_test_pcap.py              Test PCAP generator
-├── test_dpi.pcap                      Sample capture with mixed traffic
-├── CHANGES.md                         Bug fixes & enhancements log
-├── WINDOWS_SETUP.md                   Windows build instructions
+├── docker-compose.dev.yml             Development overrides (hot-reload)
+├── CMakeLists.txt                     CMake build config (3 targets)
+├── generate_test_pcap.py              Script to create synthetic test traffic
+├── test_dpi.pcap                      Sample capture file
 └── LICENSE                            MIT License
 ```
 
 ---
 
-## ⚙ C++ Engine
+## ⚙ C++ Engine — Usage & Options
 
 ### Build Targets
 
-The CMake build produces **three executables**:
+CMake produces **three executables**, each serving a different purpose:
 
 | Target | Entry Point | Description |
 |--------|-------------|-------------|
-| `dpi_engine` | `main_dpi.cpp` | **Production** — Full multi-threaded pipeline with LBs, FPs, connection tracking, rule engine |
-| `dpi_simple` | `main_working.cpp` | **Demo** — Self-contained single-threaded DPI (great for learning) |
-| `packet_analyzer` | `main.cpp` | **Legacy** — Simple packet viewer, no DPI |
+| `dpi_engine` | `main_dpi.cpp` | **Production** — Full multi-threaded pipeline with load balancers, fast paths, connection tracking, and rule management. |
+| `dpi_simple` | `main_working.cpp` | **Learning** — Self-contained single-threaded DPI demo. Good for understanding the core logic without threading complexity. |
+| `packet_analyzer` | `main.cpp` | **Legacy** — Simple packet viewer that dumps headers. No DPI, no rules. |
 
-### Usage
+### Command-Line Interface
 
 ```bash
-# Basic analysis — reads input, writes filtered output
+# Basic: read input, write filtered output
 ./build/dpi_engine <input.pcap> <output.pcap>
 
-# With blocking rules
+# Block specific applications
 ./build/dpi_engine input.pcap output.pcap \
     --block-app YouTube \
-    --block-app TikTok \
+    --block-app TikTok
+
+# Block by IP, domain, or port
+./build/dpi_engine input.pcap output.pcap \
     --block-ip 192.168.1.50 \
-    --block-domain facebook
+    --block-domain facebook \
+    --block-domain "*.tiktok.com"
 
-# Custom thread configuration
-./build/dpi_engine input.pcap output.pcap --lbs 4 --fps 4
-
-# Load rules from JSON file
+# Load rules from a JSON file
 ./build/dpi_engine input.pcap output.pcap --rules rules.json
 
-# Output analysis results as JSON
+# Configure threading (4 LBs × 4 FPs = 16 DPI threads)
+./build/dpi_engine input.pcap output.pcap --lbs 4 --fps 4
+
+# Export analysis results as JSON files
 ./build/dpi_engine input.pcap output.pcap --output-dir ./results/
 ```
 
+### Blocking Rule Types
+
+| Rule Type | How It Matches | Example |
+|-----------|----------------|---------|
+| **IP** | Exact source IP | `192.168.1.50` |
+| **App** | Application type enum | `YouTube`, `TikTok`, `Facebook` |
+| **Domain** | Suffix match (prevents misclassification) | `youtube.com` blocks `www.youtube.com` but **not** `youtubedownloader.com` |
+| **Port** | Exact destination port | `6881` (BitTorrent) |
+
 ### JSON Output
 
-When `--output-dir` is specified, three files are written atomically:
+When `--output-dir` is specified, three JSON files are written atomically (via temp file + rename):
 
 | File | Contents |
 |------|----------|
-| `stats.json` | Packet totals, thread stats, forwarded/dropped counts |
-| `flows.json` | Per-flow details: 5-tuple, app type, SNI, connection state |
+| `stats.json` | Packet totals, per-thread stats, forwarded/dropped counts |
+| `flows.json` | Per-flow details: five-tuple, app type, SNI, connection state |
 | `app_stats.json` | Per-application breakdown with percentages and detected SNIs |
 
-### Sample Report Output
+### Sample Console Report
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
@@ -332,33 +346,22 @@ When `--output-dir` is specified, three files are written atomically:
 ╚══════════════════════════════════════════════════════════════╝
 ```
 
-### Blocking Rule Types
-
-| Rule | Match Logic | Example |
-|------|-------------|---------|
-| **IP** | Exact source IP match | `192.168.1.50` |
-| **App** | Application type enum | `YouTube`, `TikTok`, `Facebook` |
-| **Domain** | Suffix match (prevents false positives) | `youtube.com` blocks `www.youtube.com` but not `youtubedownloader.com` |
-| **Port** | Destination port match | `6881` (BitTorrent) |
-
-### Supported Applications
-
-Google · YouTube · Facebook · Instagram · Twitter/X · TikTok · Netflix · Amazon · Microsoft · Apple · WhatsApp · Telegram · Discord · Spotify · Zoom · GitHub · Cloudflare
-
 ---
 
-## 🐍 Python API (NetAnalyzer)
+## 🐍 Python API — NetAnalyzer
 
-A **FastAPI** service that provides a RESTful interface for network traffic analysis. Uses **Scapy** for PCAP parsing and includes its own SNI extraction and rule engine.
+A **FastAPI** service that wraps similar DPI functionality in a REST interface. Uses **Scapy** for PCAP parsing (single-threaded, simpler than the C++ engine but easy to integrate with web apps and dashboards).
 
-### Features
+### Key Features
 
-- 📤 **PCAP Upload & Analysis** — Upload `.pcap` / `.pcapng` files for instant analysis
-- 🔍 **Flow Inspection** — Query individual flows with full 5-tuple details
-- 🚫 **Rule Management** — Full CRUD for IP, app, domain, and port blocking rules
-- 📊 **Statistics** — Aggregated analysis results with app breakdown
-- 🩺 **Health Checks** — Docker/K8s-ready liveness probes
-- 📝 **Auto Docs** — Interactive Swagger UI at `/docs`
+| Feature | Description |
+|---------|-------------|
+| 📤 **PCAP Upload** | Upload `.pcap` / `.pcapng` files via `POST /api/v1/analyze` for instant analysis |
+| 🔍 **Flow Inspection** | Query individual flows with full five-tuple, SNI, app classification, and byte counts |
+| 🚫 **Rule Management** | Full CRUD for IP, app, domain, and port blocking rules |
+| 📊 **Statistics** | Aggregated results with per-application breakdown and detected SNIs |
+| 🩺 **Health Checks** | Liveness probe at `/health` — Docker and Kubernetes ready |
+| 📝 **Swagger Docs** | Auto-generated interactive API docs at `/docs` |
 
 ---
 
@@ -369,7 +372,7 @@ A **FastAPI** service that provides a RESTful interface for network traffic anal
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/api/v1/analyze` | Upload a PCAP file for analysis |
-| `GET` | `/api/v1/analysis/stats` | Retrieve latest analysis statistics |
+| `GET` | `/api/v1/analysis/stats` | Get latest analysis statistics |
 
 ### Flows
 
@@ -378,29 +381,30 @@ A **FastAPI** service that provides a RESTful interface for network traffic anal
 | `GET` | `/api/v1/flows` | List all tracked flows |
 | `GET` | `/api/v1/flows/{id}` | Get details for a specific flow |
 
-### Rules
+### Rules (CRUD)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/v1/rules` | Get all current blocking rules |
-| `POST` | `/api/v1/rules/ips` | Block a source IP |
+| `GET` | `/api/v1/rules` | List all active blocking rules |
+| `POST` | `/api/v1/rules/ips` | Block a source IP address |
 | `DELETE` | `/api/v1/rules/ips/{ip}` | Unblock a source IP |
 | `POST` | `/api/v1/rules/apps` | Block an application |
 | `DELETE` | `/api/v1/rules/apps/{app}` | Unblock an application |
 | `POST` | `/api/v1/rules/domains` | Block a domain |
 | `DELETE` | `/api/v1/rules/domains/{domain}` | Unblock a domain |
-| `POST` | `/api/v1/rules/ports` | Block a port |
+| `POST` | `/api/v1/rules/ports` | Block a destination port |
 | `DELETE` | `/api/v1/rules/ports/{port}` | Unblock a port |
 | `DELETE` | `/api/v1/rules` | Clear all rules |
 
-### Example: Analyze a PCAP
+### Example Usage
+
+**Analyze a PCAP:**
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/analyze \
   -F "file=@capture.pcap"
 ```
 
-Response:
 ```json
 {
   "stats": {
@@ -411,7 +415,7 @@ Response:
     "forwarded": 69,
     "dropped": 8
   },
-  "flows": [ ... ],
+  "flows": [ "..." ],
   "app_breakdown": {
     "HTTPS": 39,
     "YouTube": 4,
@@ -421,7 +425,7 @@ Response:
 }
 ```
 
-### Example: Manage Rules
+**Manage blocking rules:**
 
 ```bash
 # Block YouTube
@@ -434,7 +438,7 @@ curl -X POST http://localhost:8000/api/v1/rules/ips \
   -H "Content-Type: application/json" \
   -d '{"ip": "192.168.1.50"}'
 
-# View all rules
+# View all active rules
 curl http://localhost:8000/api/v1/rules
 ```
 
@@ -444,31 +448,31 @@ curl http://localhost:8000/api/v1/rules
 
 ### Services
 
-| Service | Port | Description |
-|---------|------|-------------|
-| `netanalyzer` | `8000` | Always-on FastAPI API server |
-| `dpi-engine` | — | On-demand C++ engine (run manually) |
+| Service | Port | Behavior |
+|---------|------|----------|
+| `netanalyzer` | `8000` | **Always-on** — Starts automatically and restarts on failure. Health-checked every 30s. |
+| `dpi-engine` | — | **On-demand** — Only runs when you explicitly invoke `docker compose run`. |
 
 ### Commands
 
 ```bash
-# Start the API service
+# Start the API
 docker compose up -d netanalyzer
 
-# Check health
+# Check service health
 curl http://localhost:8000/health
 
-# Run the C++ engine
+# Run the C++ engine on a specific file
 docker compose run --rm dpi-engine /data/input.pcap /output/result.pcap
 
-# Development mode (with hot-reload)
+# Development mode (with source code hot-reload)
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up
 ```
 
 ### Container Details
 
-- **NetAnalyzer**: Python 3.11-slim, non-root user, health checks, layer-cached pip install
-- **DPI Engine**: Multi-stage build (Ubuntu 22.04 builder → minimal runtime), non-root user, all 3 binaries included
+- **NetAnalyzer** — `python:3.11-slim` base, runs as non-root user, has built-in health checks, and uses layer-cached pip installs for fast rebuilds.
+- **DPI Engine** — Multi-stage build (Ubuntu 22.04 builder → minimal runtime image), runs as non-root user, includes all three compiled binaries.
 
 ---
 
@@ -476,38 +480,42 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up
 
 ### Prerequisites
 
-- **C++ Engine**: C++17 compiler (GCC 7+ / Clang 5+), CMake 3.16+
-- **Python API**: Python 3.11+, pip
-- No external C/C++ libraries required
+| Component | Requirement |
+|-----------|-------------|
+| C++ Engine | C++17 compiler (GCC 7+ / Clang 5+), CMake 3.16+, pthreads |
+| Python API | Python 3.11+, pip |
 
-### Build
+> **Note:** The C++ engine has **zero external dependencies** — no Boost, no nlohmann/json, no libpcap. Everything is implemented from scratch using the C++ standard library only.
+
+### Build Commands
 
 ```bash
 # Standard build
 cmake -B build
 cmake --build build
 
-# With AddressSanitizer (for debugging)
+# Verify all 3 targets were built
+ls build/packet_analyzer build/dpi_engine build/dpi_simple
+
+# Build with AddressSanitizer (for memory safety debugging)
 cmake -B build -DCMAKE_BUILD_TYPE=Asan
 cmake --build build
-
-# Verify all targets built
-ls build/packet_analyzer build/dpi_engine build/dpi_simple
 ```
 
 ### Generate Test Data
 
 ```bash
 python3 generate_test_pcap.py
-# → Creates test_dpi.pcap with synthetic traffic:
-#   DNS, HTTP, HTTPS (Google, YouTube, Facebook, GitHub, etc.)
+# Creates test_dpi.pcap with synthetic traffic:
+#   DNS queries, HTTP requests, HTTPS connections
+#   (Google, YouTube, Facebook, GitHub, etc.)
 ```
 
 ---
 
 ## ⚙ Configuration
 
-### C++ Engine Rules (JSON)
+### C++ Engine — Rules File (JSON)
 
 ```json
 {
@@ -519,22 +527,23 @@ python3 generate_test_pcap.py
 }
 ```
 
-The engine supports **hot-reload** — a background thread checks the rules file every 30 seconds and automatically applies changes without restarting.
+The engine supports **hot-reload** — a background thread checks the rules file every 30 seconds and automatically applies changes without restarting the engine.
 
-### Python API (Environment Variables)
+### Python API — Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATA_DIR` | `./data` | Directory for rules and data files |
-| `LOG_LEVEL` | `INFO` | Logging verbosity |
-| `CORS_ORIGINS` | `*` | Allowed CORS origins |
-| `MAX_UPLOAD_MB` | `50` | Maximum PCAP upload size |
+| `DATA_DIR` | `./data` | Directory for `rules.json` and uploaded files |
+| `LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `CORS_ORIGINS` | `*` | Comma-separated allowed CORS origins |
+| `MAX_UPLOAD_MB` | `50` | Maximum PCAP upload size in megabytes |
+| `PORT` | `8000` | Port the API listens on |
 
 ---
 
 ## 🧪 Testing
 
-### Python API Tests
+### Python API
 
 ```bash
 cd netanalyzer
@@ -543,23 +552,23 @@ pytest -v
 ```
 
 Test coverage includes:
-- PCAP analysis endpoint
+- PCAP upload and analysis endpoint
 - Flow storage and retrieval
 - Rule engine CRUD operations
 - SNI extraction accuracy
 
-### C++ Engine Verification
+### C++ Engine
 
 ```bash
-# Basic functionality
+# Basic functionality test
 ./build/dpi_engine test_dpi.pcap output.pcap
 
-# Verify consistent output (determinism test)
+# Determinism test — output should be identical across runs
 ./build/dpi_engine test_dpi.pcap out1.pcap
 ./build/dpi_engine test_dpi.pcap out2.pcap
-diff out1.pcap out2.pcap  # Should be identical
+diff out1.pcap out2.pcap   # should produce no output
 
-# AddressSanitizer (memory safety)
+# Memory safety test with AddressSanitizer
 cmake -B build -DCMAKE_BUILD_TYPE=Asan && cmake --build build
 ./build/dpi_engine test_dpi.pcap output.pcap
 ```
@@ -569,9 +578,3 @@ cmake -B build -DCMAKE_BUILD_TYPE=Asan && cmake --build build
 ## 📜 License
 
 This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
-
----
-
-<p align="center">
-  <sub>Built with ❤️ by <a href="https://github.com/Izhaar-ahmed">Izhaar Ahmed</a></sub>
-</p>

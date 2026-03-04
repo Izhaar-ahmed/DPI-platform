@@ -1,0 +1,42 @@
+# ============================================================================
+# Docker Compose — DPI Platform
+# ============================================================================
+# Services:
+#   netanalyzer  — Always-on FastAPI service (port 8000)
+#   dpi-engine   — On-demand C++ engine (run with: docker compose run dpi-engine)
+# ============================================================================
+
+version: "3.8"
+
+services:
+  # Python NetAnalyzer API — always running
+  netanalyzer:
+    build:
+      context: ./netanalyzer
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./netanalyzer/data:/app/data
+    environment:
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # C++ DPI Engine — on-demand processing
+  # Usage: docker compose run dpi-engine <input.pcap> <output.pcap> [options]
+  dpi-engine:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cpp
+    profiles:
+      - engine # Only runs when explicitly requested
+    volumes:
+      - ./data:/data
+      - ./output:/output

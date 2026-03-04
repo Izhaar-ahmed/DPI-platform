@@ -1,0 +1,24 @@
+# ============================================================================
+# Docker Compose — Dev variant with hot-reload
+# ============================================================================
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+# ============================================================================
+
+version: "3.8"
+
+services:
+  netanalyzer:
+    build:
+      context: ./netanalyzer
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount source code for hot-reload during development
+      - ./netanalyzer/app:/app/app
+      - ./netanalyzer/data:/app/data
+    environment:
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=DEBUG
+    # Override CMD with --reload for auto-restart on code changes
+    command: [ "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload" ]
